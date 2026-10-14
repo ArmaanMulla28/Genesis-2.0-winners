@@ -127,8 +127,27 @@ def main() -> None:
     assert res_invalid.status_code == 422
     print(">>> PASS: Incompatible patch was safely rejected.")
 
-    # Step 8: Reset API and Registry
-    print_step(8, "Restoring baseline via POST /admin/reset-api")
+    # Step 8: Phase 3 Metrics & Admin Audit Endpoint Verification
+    print_step(8, "Phase 3 Metrics & Admin Audit-Logs Inspection")
+    res_metrics = client.get("/admin/metrics")
+    print(f"GET /admin/metrics -> HTTP {res_metrics.status_code}")
+    metrics = res_metrics.json()
+    print(f"Metrics: {metrics}")
+    assert res_metrics.status_code == 200
+    assert metrics["total_recovery_attempts"] == 2  # 1 success + 1 rejection
+    assert metrics["successful_recoveries"] == 1
+    assert metrics["failed_recoveries"] == 1
+    assert metrics["patch_rejection_count"] == 1
+    assert metrics["adaptation_rate"] == 50.0
+    print(">>> PASS: /admin/metrics calculations match observed audit events.")
+
+    res_audit_admin = client.get("/admin/audit-logs?limit=10")
+    assert res_audit_admin.status_code == 200
+    assert res_audit_admin.json()["total_events"] == 2
+    print(">>> PASS: GET /admin/audit-logs verified.")
+
+    # Step 9: Reset API, Registry, and Metrics
+    print_step(9, "Restoring baseline via POST /admin/reset-api")
     res_reset = client.post("/admin/reset-api")
     print(f"POST /admin/reset-api -> HTTP {res_reset.status_code}")
     assert res_reset.status_code == 200

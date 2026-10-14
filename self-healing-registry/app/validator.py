@@ -80,7 +80,8 @@ class SchemaPatchValidator:
 
         # Check for prohibited security field injection
         for key in original_payload.keys():
-            if str(key).lower() in cls.RESTRICTED_SECURITY_FIELDS:
+            key_lower = str(key).lower()
+            if any(sec in key_lower for sec in cls.RESTRICTED_SECURITY_FIELDS):
                 return PatchValidationResult(
                     is_valid=False,
                     reason=f"Security violation: payload contains unauthorized security field '{key}'",

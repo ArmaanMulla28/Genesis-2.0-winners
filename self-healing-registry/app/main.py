@@ -5,15 +5,17 @@ This module provides the complete FastAPI application for:
 "Self-Healing Tool Registry — Automatic Recovery from Runtime API Schema Drift"
 
 Endpoints:
-- POST   /student         : Student registration endpoint (healed transparently on drift).
-- POST   /admin/break-api : Simulates runtime API drift (switches active schema from v1 to v2).
-- POST   /admin/reset-api : Resets active schema and tool registry back to original (v1).
-- GET    /schema          : Exposes trusted active schema definition and historical comparisons.
-- GET    /registry        : Inspects current in-memory tool registry contracts and versions.
-- GET    /audit           : Inspects structured audit trail of all recovery events.
-- DELETE /audit           : Clears audit log.
-- GET    /health          : Quick health check confirming the server is live.
-- GET    /                : Welcome index with quick links to docs and available endpoints.
+- POST   /student           : Student registration endpoint (healed transparently on drift).
+- POST   /admin/break-api   : Simulates runtime API drift (switches active schema from v1 to v2).
+- POST   /admin/reset-api   : Resets active schema and tool registry back to original (v1).
+- GET    /schema            : Exposes trusted active schema definition and historical comparisons.
+- GET    /registry          : Inspects current in-memory tool registry contracts and versions.
+- GET    /admin/audit-logs  : Inspects structured audit trail of all recovery events (Phase 3).
+- GET    /admin/metrics     : Evaluates key recovery metrics: adaptation rate, MTTR, retries (Phase 3).
+- GET    /audit             : Backward-compatible alias for audit events.
+- DELETE /audit             : Clears audit log.
+- GET    /health            : Quick health check confirming the server is live.
+- GET    /                  : Welcome index with quick links to docs and available endpoints.
 """
 
 from typing import Any, Dict, List, Optional, Type
@@ -23,6 +25,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ValidationError
 
 from app.audit import audit_logger
+from app.metrics import RecoveryMetricsCalculator
 from app.models import (
     AdminActionResponse,
     HealthResponse,
@@ -120,9 +123,21 @@ app = FastAPI(
         "self-healing middleware that intercepts schema mismatches, obtains trusted schemas, "
         "validates transformation patches, updates tool registry contracts, and executes bounded retries."
     ),
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+# Enable CORS for local frontend development (e.g., Vite at http://localhost:5173)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Register pure ASGI Self-Healing Middleware
@@ -188,33 +203,89 @@ async def get_registry() -> Dict[str, Any]:
     }
 
 
+# ==============================================================================
+# Administrative & Audit Endpoints (Phase 3)
+# ==============================================================================
+
+@app.get(
+    "/admin/audit-logs",
+    summary="Retrieve Recovery Audit Logs",
+    tags=["Admin & Evaluation"],
+)
+async def get_admin_audit_logs(
+    limit: Optional[int] = Query(
+        default=50,
+        ge=1,
+        le=1000,
+        description="Maximum number of recent audit events to retrieve",
+    )
+) -> Dict[str, Any]:
+    """
+    View recent structured audit records for all recovery attempts.
+    Includes unique attempt IDs, timestamps, failure reasons, patch decisions,
+    retries, MTTR timings, and final HTTP outcomes.
+    Sensitive tokens and request secrets are redacted.
+    """
+    events = audit_logger.get_events(limit=limit)
+    return {
+        "status": "success",
+        "total_events": len(events),
+        "limit": limit,
+        "admin_context": "local_demo_environment",
+        "events": events,
+    }
+
+
+@app.get(
+    "/admin/metrics",
+    summary="Retrieve Evaluation Metrics",
+    tags=["Admin & Evaluation"],
+)
+async def get_admin_metrics() -> Dict[str, Any]:
+    """
+    Compute real-time statistical evaluation metrics:
+    - total_recovery_attempts: Total count of recovery attempts.
+    - successful_recoveries: Count of successful recoveries.
+    - failed_recoveries: Count of failed recoveries.
+    - adaptation_rate: (successful_recoveries / eligible_recovery_attempts) * 100.
+    - mean_time_to_recovery_ms: Mean Time to Recovery (MTTR) in ms for successful recoveries.
+    - average_retry_count: Average retry count across recovery attempts.
+    - patch_rejection_count: Count of rejected patches.
+    """
+    return RecoveryMetricsCalculator.calculate_metrics()
+
+
 @app.get(
     "/audit",
-    summary="Inspect Self-Healing Audit Trail",
-    tags=["Self-Healing Audit"],
+    summary="Inspect Self-Healing Audit Trail (Alias)",
+    tags=["Admin & Evaluation"],
 )
 async def get_audit_events() -> Dict[str, Any]:
     """
-    Retrieve structured audit events for all recovery attempts.
-    Includes timestamps, tool names, patch decisions, retry counts, and outcomes.
+    Retrieve structured audit events for all recovery attempts (Phase 2 compatibility alias).
     """
+    events = audit_logger.get_events()
     return {
         "status": "success",
-        "total_events": len(audit_logger.get_events()),
-        "events": audit_logger.get_events(),
+        "total_events": len(events),
+        "events": events,
     }
 
 
 @app.delete(
     "/audit",
     summary="Clear Audit Events",
-    tags=["Self-Healing Audit"],
+    tags=["Admin & Evaluation"],
 )
 async def clear_audit_events() -> Dict[str, Any]:
     """Clear all recorded audit events."""
     audit_logger.clear()
     return {"status": "success", "message": "Audit trail cleared."}
 
+
+# ==============================================================================
+# Service & Admin Action Endpoints
+# ==============================================================================
 
 @app.post(
     "/student",
@@ -345,15 +416,16 @@ async def break_api() -> AdminActionResponse:
 )
 async def reset_api() -> AdminActionResponse:
     """
-    Restores active API schema back to original v1 format and resets the Tool Registry.
-    Allows testing and demo cycles to be repeated cleanly.
+    Restores active API schema back to original v1 format, resets Tool Registry,
+    and clears the audit trail.
+    Allows testing and evaluation cycles to be repeated cleanly.
     """
     previous = state.reset_api()
     tool_registry.reset()
     audit_logger.clear()
     return AdminActionResponse(
         status="success",
-        message="API reset: Active schema and tool registry restored to original v1 format.",
+        message="API reset: Active schema, tool registry, and audit log restored to original v1 format.",
         previous_schema_version=previous,
         active_schema_version=state.active_version.value,
         expected_format={"user_id": "123"},

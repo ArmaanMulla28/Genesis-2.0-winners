@@ -3,23 +3,25 @@ recovery.py - Self-Healing Middleware and Recovery Coordination Engine.
 
 Coordinates the end-to-end self-healing lifecycle:
 1. Intercepts schema validation failures (HTTP 422).
-2. Checks bounded retry guardrails (strictly maximum 1 retry).
-3. Fetches the trusted active schema from the authoritative schema registry.
-4. Proposes a known, safe transformation patch.
-5. Validates the patch and transformed payload against the target model.
-6. Updates the in-memory tool registry ONLY after successful validation.
-7. Retries the request with the transformed payload.
-8. Records detailed structured audit events for every attempt.
+2. Distinguishes schema drift from unrelated errors (auth, server errors, same-version validation).
+3. Checks bounded retry guardrails (strictly maximum 1 retry).
+4. Fetches the trusted active schema from the authoritative schema registry.
+5. Proposes a known, safe transformation patch.
+6. Validates the patch and transformed payload against the target model.
+7. Updates the in-memory tool registry ONLY after successful validation.
+8. Retries the request with the transformed payload.
+9. Records detailed structured audit events with MTTR timing and final HTTP statuses.
 """
 
 import json
+import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs
 
 from app.audit import audit_logger
 from app.models import SchemaVersion
 from app.registry import tool_registry
-from app.validator import SchemaPatchValidator
+from app.validator import PatchValidationResult, SchemaPatchValidator
 
 
 class RecoveryResult:
@@ -33,6 +35,7 @@ class RecoveryResult:
         previous_version: Optional[str] = None,
         target_version: Optional[str] = None,
         patch_decision: Optional[str] = None,
+        patch_validation_result: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.success = success
         self.reason = reason
@@ -40,6 +43,7 @@ class RecoveryResult:
         self.previous_version = previous_version
         self.target_version = target_version
         self.patch_decision = patch_decision
+        self.patch_validation_result = patch_validation_result or {}
 
 
 class RecoveryCoordinator:
@@ -51,7 +55,7 @@ class RecoveryCoordinator:
     MAX_RETRIES: int = 1
 
     def __init__(self, state_manager: Any) -> None:
-        # References the active server state manager for trusted schema retrieval
+        # Authoritative state manager for trusted schema retrieval
         self.state_manager = state_manager
 
     def attempt_recovery(
@@ -61,13 +65,17 @@ class RecoveryCoordinator:
         method: str,
         original_payload: Any,
         current_retry_count: int = 0,
+        start_time: Optional[float] = None,
     ) -> RecoveryResult:
         """
         Coordinates the recovery attempt for a failed request.
         """
+        t0 = start_time if start_time is not None else time.perf_counter()
+
         # 1. Enforce strict bounded retry limit
         if current_retry_count >= self.MAX_RETRIES:
             reason = f"Retry limit exceeded: already attempted {current_retry_count} retries (max {self.MAX_RETRIES})"
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             audit_logger.record_event(
                 tool_name=tool_name,
                 endpoint=endpoint,
@@ -78,12 +86,20 @@ class RecoveryCoordinator:
                 transformed_payload=None,
                 failure_reason="schema_mismatch_422",
                 patch_decision="ABORTED_RETRY_LIMIT_EXCEEDED",
+                patch_validation_result={"is_valid": False, "reason": reason},
                 retry_count=current_retry_count,
                 max_retries=self.MAX_RETRIES,
                 final_outcome="RETRY_LIMIT_EXCEEDED",
+                final_http_status=422,
+                elapsed_time_ms=elapsed_ms,
                 error_detail=reason,
             )
-            return RecoveryResult(success=False, reason=reason)
+            return RecoveryResult(
+                success=False,
+                reason=reason,
+                patch_decision="ABORTED_RETRY_LIMIT_EXCEEDED",
+                patch_validation_result={"is_valid": False, "reason": reason},
+            )
 
         # 2. Retrieve trusted active schema from the authoritative state
         # (Never infer schema solely from an HTTP error response)
@@ -99,6 +115,7 @@ class RecoveryCoordinator:
         if source_version == target_version:
             # Payload simply violated current schema rules, no drift occurred
             reason = f"No schema drift detected. Registry and server are both on version '{target_version}'."
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             audit_logger.record_event(
                 tool_name=tool_name,
                 endpoint=endpoint,
@@ -109,12 +126,22 @@ class RecoveryCoordinator:
                 transformed_payload=None,
                 failure_reason="validation_error_no_drift",
                 patch_decision="NO_ACTION_VERSIONS_MATCH",
+                patch_validation_result={"is_valid": False, "reason": reason},
                 retry_count=current_retry_count,
                 max_retries=self.MAX_RETRIES,
                 final_outcome="REJECTED",
+                final_http_status=422,
+                elapsed_time_ms=elapsed_ms,
                 error_detail=reason,
             )
-            return RecoveryResult(success=False, reason=reason)
+            return RecoveryResult(
+                success=False,
+                reason=reason,
+                previous_version=source_version,
+                target_version=target_version,
+                patch_decision="NO_ACTION_VERSIONS_MATCH",
+                patch_validation_result={"is_valid": False, "reason": reason},
+            )
 
         # 4. Propose and validate transformation patch
         patch_decision = f"PROPOSED_KNOWN_MIGRATION_{source_version.upper()}_TO_{target_version.upper()}"
@@ -126,6 +153,7 @@ class RecoveryCoordinator:
 
         # 5. Handle rejected / invalid patches
         if not validation_result.is_valid:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             audit_logger.record_event(
                 tool_name=tool_name,
                 endpoint=endpoint,
@@ -136,9 +164,12 @@ class RecoveryCoordinator:
                 transformed_payload=None,
                 failure_reason="schema_mismatch_422",
                 patch_decision=f"REJECTED_INVALID_PATCH: {validation_result.reason}",
+                patch_validation_result=validation_result.to_dict(),
                 retry_count=current_retry_count,
                 max_retries=self.MAX_RETRIES,
                 final_outcome="REJECTED",
+                final_http_status=422,
+                elapsed_time_ms=elapsed_ms,
                 error_detail=validation_result.reason,
             )
             return RecoveryResult(
@@ -147,6 +178,7 @@ class RecoveryCoordinator:
                 previous_version=source_version,
                 target_version=target_version,
                 patch_decision="REJECTED",
+                patch_validation_result=validation_result.to_dict(),
             )
 
         # 6. Patch is verified! Update the in-memory Tool Registry
@@ -157,23 +189,6 @@ class RecoveryCoordinator:
             reason=f"self_healed_from_{source_version}_to_{target_version}",
         )
 
-        # 7. Record successful audit event
-        audit_logger.record_event(
-            tool_name=tool_name,
-            endpoint=endpoint,
-            method=method,
-            previous_schema_version=source_version,
-            target_schema_version=target_version,
-            original_payload=original_payload,
-            transformed_payload=validation_result.transformed_payload,
-            failure_reason="schema_mismatch_422",
-            patch_decision=f"APPLIED_AND_VERIFIED_{source_version.upper()}_TO_{target_version.upper()}",
-            retry_count=current_retry_count + 1,
-            max_retries=self.MAX_RETRIES,
-            final_outcome="SUCCESS",
-            error_detail=None,
-        )
-
         return RecoveryResult(
             success=True,
             reason="Recovery successful: payload transformed and registry updated.",
@@ -181,6 +196,7 @@ class RecoveryCoordinator:
             previous_version=source_version,
             target_version=target_version,
             patch_decision=patch_decision,
+            patch_validation_result=validation_result.to_dict(),
         )
 
 
@@ -246,16 +262,24 @@ class SelfHealingASGIMiddleware:
                 captured_headers = message.get("headers", [])
             captured_messages.append(message)
 
+        # Start timer at moment of initial execution
+        t0 = time.perf_counter()
+
         # First attempt
         await self.app(scope, initial_receive, capture_send)
 
-        # If response is NOT 422, request succeeded or has non-schema error; return immediately
+        # Distinguish error types:
+        # If response is NOT 422 (e.g. 200 OK, 401 Unauthorized, 403 Forbidden, 500 Server Error):
+        # Do NOT attempt recovery; flush response immediately
         if captured_status != 422:
             for msg in captured_messages:
                 await send(msg)
             return
 
         # Attempt self-healing recovery on HTTP 422
+        # Measurement boundary: Start MTTR timer from detection of recoverable failure
+        recovery_start_time = time.perf_counter()
+
         try:
             original_payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
         except Exception:
@@ -269,6 +293,7 @@ class SelfHealingASGIMiddleware:
             method=method,
             original_payload=original_payload,
             current_retry_count=current_retry,
+            start_time=recovery_start_time,
         )
 
         if not recovery_result.success:
@@ -295,14 +320,40 @@ class SelfHealingASGIMiddleware:
         new_headers.append((b"x-self-healing-applied", b"true"))
         scope["headers"] = new_headers
 
+        retry_status: Optional[int] = None
+
         # Re-dispatch request with new body to the application
-        # Wrap send to add self-healing recovery metadata headers in response
         async def enhanced_send(message: Any) -> None:
+            nonlocal retry_status
             if message["type"] == "http.response.start":
+                retry_status = message["status"]
                 resp_headers = list(message.get("headers", []))
                 resp_headers.append((b"x-self-healing-recovered", b"true"))
-                resp_headers.append((b"x-self-healing-version", recovery_result.target_version.encode("latin1")))
+                resp_headers.append((b"x-self-healing-version", str(recovery_result.target_version).encode("latin1")))
                 message["headers"] = resp_headers
             await send(message)
 
         await self.app(scope, retry_receive, enhanced_send)
+
+        # Record successful audit event with full MTTR measurement
+        elapsed_ms = (time.perf_counter() - recovery_start_time) * 1000.0
+        final_status = retry_status if retry_status is not None else 200
+
+        audit_logger.record_event(
+            tool_name="student_service",
+            endpoint=path,
+            method=method,
+            previous_schema_version=recovery_result.previous_version or "v1",
+            target_schema_version=recovery_result.target_version,
+            original_payload=original_payload,
+            transformed_payload=recovery_result.transformed_payload,
+            failure_reason="schema_mismatch_422",
+            patch_decision=f"APPLIED_AND_VERIFIED_{(recovery_result.previous_version or 'v1').upper()}_TO_{(recovery_result.target_version or 'v2').upper()}",
+            patch_validation_result=recovery_result.patch_validation_result,
+            retry_count=current_retry + 1,
+            max_retries=self.coordinator.MAX_RETRIES,
+            final_outcome="SUCCESS",
+            final_http_status=final_status,
+            elapsed_time_ms=elapsed_ms,
+            error_detail=None,
+        )
